@@ -209,8 +209,29 @@ def build_calendar(year, month):
 # ================== ЛОГИКА ДИАЛОГА ==================
 
 def start_add_flow(chat_id):
-    set_state(chat_id, "ask_title")
-    send_message(chat_id, "Как назвать платёж? (например «Тинькофф»). Если не важно — отправь «-».")
+    set_state(chat_id, "ask_bank_amount")
+    send_message(
+        chat_id,
+        "Введи банк и сумму одной строкой, например:\nТинькофф 5000\n\n"
+        "Если название не важно — просто отправь сумму: 5000",
+    )
+
+
+def parse_bank_amount(text):
+    """Разбирает строку вида 'Тинькофф 5000' или '5000' на (название, сумма).
+    Возвращает (title, amount) или (None, None), если сумму распознать не удалось."""
+    parts = text.strip().split()
+    if not parts:
+        return None, None
+
+    last = parts[-1].replace(",", ".")
+    try:
+        amount = float(last)
+    except ValueError:
+        return None, None
+
+    title = " ".join(parts[:-1]).strip()
+    return title, amount
 
 
 def handle_text(chat_id, text):
@@ -245,18 +266,15 @@ def handle_text(chat_id, text):
 
     step, data = get_state(chat_id)
 
-    if step == "ask_title":
-        data["title"] = "" if text == "-" else text
-        set_state(chat_id, "ask_amount", data)
-        send_message(chat_id, "Введи сумму платежа (например: 5000):")
-        return
-
-    if step == "ask_amount":
-        try:
-            amount = float(text.replace(",", "."))
-        except ValueError:
-            send_message(chat_id, "Не похоже на число. Введи сумму ещё раз (например: 5000):")
+    if step == "ask_bank_amount":
+        title, amount = parse_bank_amount(text)
+        if amount is None:
+            send_message(
+                chat_id,
+                "Не разобрал сумму. Напиши так: Тинькофф 5000 (или просто 5000, если без названия).",
+            )
             return
+        data["title"] = title
         data["amount"] = amount
         set_state(chat_id, "ask_date", data)
         today = date.today()
