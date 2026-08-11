@@ -31,7 +31,10 @@ def init_db():
             title TEXT,
             amount REAL NOT NULL,
             due_date TEXT NOT NULL,
-            paid INTEGER NOT NULL DEFAULT 0
+            paid INTEGER NOT NULL DEFAULT 0,
+            series_id INTEGER,
+            series_index INTEGER,
+            series_total INTEGER
         )
         """
     )
@@ -44,6 +47,17 @@ def init_db():
         )
         """
     )
+    # миграция для баз, созданных до появления регулярных платежей —
+    # если колонки уже есть, Turso вернёт ошибку, её просто игнорируем
+    for ddl in (
+        "ALTER TABLE payments ADD COLUMN series_id INTEGER",
+        "ALTER TABLE payments ADD COLUMN series_index INTEGER",
+        "ALTER TABLE payments ADD COLUMN series_total INTEGER",
+    ):
+        try:
+            turso_db.execute(ddl)
+        except Exception:
+            pass
 
 
 _DB_READY = False
@@ -76,16 +90,38 @@ def clear_state(chat_id):
     turso_db.execute("DELETE FROM chat_state WHERE chat_id = ?", [chat_id])
 
 
-def add_payment(chat_id, title, amount, due_date):
-    turso_db.execute(
-        "INSERT INTO payments (chat_id, title, amount, due_date, paid) VALUES (?, ?, ?, ?, 0)",
-        [chat_id, title, amount, due_date],
+def add_payment(chat_id, title, amount, due_date, series_id=None, series_index=None, series_total=None):
+    rows = turso_db.execute(
+        "INSERT INTO payments (chat_id, title, amount, due_date, paid, series_id, series_index, series_total) "
+        "VALUES (?, ?, ?, ?, 0, ?, ?, ?) RETURNING id",
+        [chat_id, title, amount, due_date, series_id, series_index, series_total],
     )
+    return rows[0][0] if rows else None
+
+
+def add_months(d: date, months: int) -> date:
+    """Прибавляет к дате указанное число месяцев, сохраняя число (с учётом коротких месяцев)."""
+    total = d.month - 1 + months
+    year = d.year + total // 12
+    month = total % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def add_series(chat_id, title, amount, start_date: date, count: int):
+    """Создаёт серию регулярных (ежемесячных) платежей."""
+    first_id = add_payment(chat_id, title, amount, start_date.isoformat(), series_total=count, series_index=1)
+    turso_db.execute("UPDATE payments SET series_id=? WHERE id=?", [first_id, first_id])
+    for i in range(1, count):
+        next_date = add_months(start_date, i)
+        add_payment(chat_id, title, amount, next_date.isoformat(), series_id=first_id, series_index=i + 1, series_total=count)
+    return first_id
 
 
 def get_unpaid(chat_id):
     return turso_db.execute(
-        "SELECT id, title, amount, due_date FROM payments WHERE chat_id=? AND paid=0 ORDER BY due_date ASC",
+        "SELECT id, title, amount, due_date, series_id, series_index, series_total "
+        "FROM payments WHERE chat_id=? AND paid=0 ORDER BY due_date ASC",
         [chat_id],
     )
 
@@ -102,6 +138,20 @@ def mark_paid(payment_id):
 
 def delete_payment(payment_id):
     turso_db.execute("DELETE FROM payments WHERE id=?", [payment_id])
+
+
+def get_series_id(payment_id):
+    rows = turso_db.execute("SELECT series_id FROM payments WHERE id=?", [payment_id])
+    return rows[0][0] if rows else None
+
+
+def update_amount(payment_id, new_amount):
+    """Меняет сумму. Если платёж — часть серии, обновляет её у всех ЕЩЁ НЕ оплаченных платежей серии."""
+    series_id = get_series_id(payment_id)
+    if series_id:
+        turso_db.execute("UPDATE payments SET amount=? WHERE series_id=? AND paid=0", [new_amount, series_id])
+    else:
+        turso_db.execute("UPDATE payments SET amount=? WHERE id=?", [new_amount, payment_id])
 
 
 # ================== TELEGRAM API ==================
@@ -147,19 +197,35 @@ def main_menu_keyboard():
     }
 
 
+def fmt_date(iso_date: str) -> str:
+    return datetime.strptime(iso_date, "%Y-%m-%d").date().strftime("%d.%m.%y")
+
+
 def build_list_text_and_keyboard(chat_id):
     rows = get_unpaid(chat_id)
     if not rows:
         return "Список пуст — все платежи оплачены 🎉", None
 
+    seen_groups = set()
+    display_rows = []
+    for row in rows:
+        payment_id, title, amount, due_date, series_id, series_index, series_total = row
+        group_key = series_id if series_id else f"single-{payment_id}"
+        if group_key in seen_groups:
+            continue
+        seen_groups.add(group_key)
+        display_rows.append(row)
+
     lines = ["Твои платежи:\n"]
     buttons = []
-    for payment_id, title, amount, due_date in rows:
-        d = datetime.strptime(due_date, "%Y-%m-%d").date().strftime("%d.%m.%Y")
+    for payment_id, title, amount, due_date, series_id, series_index, series_total in display_rows:
+        d = fmt_date(due_date)
         label = f"{title}: " if title else ""
-        lines.append(f"• {label}{amount:.2f} руб. — до {d}")
+        suffix = f" 🔁{series_index}/{series_total}" if series_total and series_total > 1 else ""
+        lines.append(f"• {label}{amount:.2f} руб. — до {d}{suffix}")
         buttons.append([
-            {"text": f"✅ {label}{amount:.2f} до {d}", "callback_data": f"paid:{payment_id}"},
+            {"text": "✅ Оплачено", "callback_data": f"paid:{payment_id}"},
+            {"text": "✏️ Сумма", "callback_data": f"edit:{payment_id}"},
             {"text": "🗑", "callback_data": f"del:{payment_id}"},
         ])
 
@@ -172,7 +238,7 @@ def build_calendar(year, month):
     """Строит inline-клавиатуру календаря на месяц."""
     buttons = []
 
-    buttons.append([{"text": f"{MONTHS_RU[month]} {year}", "callback_data": "cal:ignore"}])
+    buttons.append([{"text": f"{MONTHS_RU[month]} {year % 100:02d}", "callback_data": "cal:ignore"}])
 
     week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     buttons.append([{"text": d, "callback_data": "cal:ignore"} for d in week_days])
@@ -214,34 +280,18 @@ def start_add_flow(chat_id):
     send_message(
         chat_id,
         "Введи платёж одной строкой:\nБанк Сумма [Дата]\n\n"
-        "Например:\nТинькофф 5000\nТинькофф 5000 25.08.2026\n5000\n\n"
-        "Дату можно не указывать — тогда я предложу выбрать её в календаре.",
+        "Например:\nТинькофф 5000\nТинькофф 5000 25.08.26\n5000\n\n"
+        "Дату можно не указывать — тогда предложу выбрать её в календаре.",
     )
 
 
-DATE_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}$")
-
-
-def parse_bank_amount(text):
-    """Разбирает строку вида 'Тинькофф 5000' или '5000' на (название, сумма).
-    Возвращает (title, amount) или (None, None), если сумму распознать не удалось."""
-    parts = text.strip().split()
-    if not parts:
-        return None, None
-
-    last = parts[-1].replace(",", ".")
-    try:
-        amount = float(last)
-    except ValueError:
-        return None, None
-
-    title = " ".join(parts[:-1]).strip()
-    return title, amount
+# дата в конце строки: ДД.ММ.ГГ или ДД.ММ.ГГГГ
+DATE_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.(\d{4}|\d{2})$")
 
 
 def parse_bank_amount_date(text):
-    """Разбирает строку вида 'Тинькофф 5000 25.08.2026'.
-    Возвращает (title, amount, due_date_or_None, error_or_None).
+    """Разбирает строку вида 'Тинькофф 5000 25.08.26'.
+    Возвращает (title, amount, due_date_iso_or_None, error_or_None).
     Если дата в конце строки не найдена — due_date будет None (значит, нужен календарь).
     Если дата найдена, но некорректна — возвращается error."""
     parts = text.strip().split()
@@ -251,8 +301,10 @@ def parse_bank_amount_date(text):
     due_date = None
     if DATE_RE.match(parts[-1]):
         date_token = parts.pop()
+        year_part = date_token.split(".")[-1]
+        fmt = "%d.%m.%Y" if len(year_part) == 4 else "%d.%m.%y"
         try:
-            due_date = datetime.strptime(date_token, "%d.%m.%Y").date().isoformat()
+            due_date = datetime.strptime(date_token, fmt).date().isoformat()
         except ValueError:
             return None, None, None, "bad_date"
         if not parts:
@@ -268,6 +320,35 @@ def parse_bank_amount_date(text):
     return title, amount, due_date, None
 
 
+def ask_count(chat_id, message_id=None):
+    text = (
+        "Сколько раз повторить платёж?\n"
+        "Введи 1, если платёж разовый, или число месяцев подряд (например 6)."
+    )
+    if message_id:
+        edit_message(chat_id, message_id, text)
+    else:
+        send_message(chat_id, text)
+
+
+def finalize_payment(chat_id, title, amount, due_date_iso, count):
+    due = date.fromisoformat(due_date_iso)
+    d = fmt_date(due_date_iso)
+    label = f"{title} — " if title else ""
+
+    if count <= 1:
+        add_payment(chat_id, title, amount, due_date_iso)
+        send_message(chat_id, f"Готово ✅\nЗаписал: {label}{amount:.2f} руб. до {d}", keyboard=main_menu_keyboard())
+    else:
+        add_series(chat_id, title, amount, due, count)
+        send_message(
+            chat_id,
+            f"Готово ✅\nСоздал регулярный платёж на {count} мес.\n"
+            f"Ближайший: {label}{amount:.2f} руб. до {d}",
+            keyboard=main_menu_keyboard(),
+        )
+
+
 def handle_text(chat_id, text):
     text = text.strip()
 
@@ -278,6 +359,7 @@ def handle_text(chat_id, text):
             chat_id,
             "Привет! Я помогу не забывать про платежи по кредитке.\n\n"
             "Жми кнопки внизу экрана или используй команды /add и /list.\n"
+            "Могу вести и регулярные (ежемесячные) платежи.\n"
             "За день до платежа и в день платежа я сам пришлю напоминание.",
             keyboard=main_menu_keyboard(),
         )
@@ -304,51 +386,64 @@ def handle_text(chat_id, text):
         title, amount, due_date, error = parse_bank_amount_date(text)
 
         if error == "bad_date":
-            send_message(chat_id, "Дата некорректна. Формат: ДД.ММ.ГГГГ, например 25.08.2026. Попробуй ещё раз.")
+            send_message(chat_id, "Дата некорректна. Формат: ДД.ММ.ГГ, например 25.08.26. Попробуй ещё раз.")
             return
-        if error == "bad_amount" or error == "empty":
+        if error in ("bad_amount", "empty"):
             send_message(
                 chat_id,
-                "Не разобрал сумму. Напиши так: Тинькофф 5000 (можно добавить дату: Тинькофф 5000 25.08.2026).",
+                "Не разобрал сумму. Напиши так: Тинькофф 5000 (можно добавить дату: Тинькофф 5000 25.08.26).",
             )
-            return
-
-        if due_date:
-            clear_state(chat_id)
-            add_payment(chat_id, title, amount, due_date)
-            label = f"{title} — " if title else ""
-            d = datetime.strptime(due_date, "%Y-%m-%d").date().strftime("%d.%m.%Y")
-            send_message(chat_id, f"Готово ✅\nЗаписал: {label}{amount:.2f} руб. до {d}", keyboard=main_menu_keyboard())
             return
 
         data["title"] = title
         data["amount"] = amount
-        set_state(chat_id, "ask_date", data)
-        today = date.today()
-        send_message(chat_id, "Дату не указал — выбери в календаре:", keyboard=build_calendar(today.year, today.month))
+
+        if due_date:
+            data["due_date"] = due_date
+            set_state(chat_id, "ask_count", data)
+            ask_count(chat_id)
+        else:
+            set_state(chat_id, "ask_date", data)
+            today = date.today()
+            send_message(chat_id, "Дату не указал — выбери в календаре:", keyboard=build_calendar(today.year, today.month))
         return
 
-    # На шаге даты пользователь должен нажимать календарь, а не писать текст
     if step == "ask_date":
         send_message(chat_id, "Выбери дату кнопками в календаре выше 👆")
         return
 
-    send_message(chat_id, "Не понял. Используй кнопки внизу или команды /add, /list", keyboard=main_menu_keyboard())
+    if step == "ask_count":
+        try:
+            count = int(text.strip())
+        except ValueError:
+            send_message(chat_id, "Нужно число. Введи 1 для разового платежа или сколько месяцев повторить.")
+            return
+        if count < 1:
+            send_message(chat_id, "Число должно быть 1 или больше. Попробуй ещё раз.")
+            return
 
-
-def finish_add_with_date(chat_id, message_id, due_date_str):
-    step, data = get_state(chat_id)
-    if step != "ask_date":
+        title = data.get("title", "")
+        amount = data["amount"]
+        due_date_iso = data["due_date"]
+        clear_state(chat_id)
+        finalize_payment(chat_id, title, amount, due_date_iso, count)
         return
 
-    due = datetime.strptime(due_date_str, "%Y-%m-%d").date()
-    title = data.get("title", "")
-    amount = data["amount"]
-    add_payment(chat_id, title, amount, due.isoformat())
-    clear_state(chat_id)
+    if step == "edit_amount":
+        try:
+            new_amount = float(text.replace(",", "."))
+        except ValueError:
+            send_message(chat_id, "Не похоже на число. Введи сумму ещё раз (например: 5000):")
+            return
+        payment_id = data.get("edit_payment_id")
+        clear_state(chat_id)
+        update_amount(payment_id, new_amount)
+        send_message(chat_id, "Сумма обновлена ✅")
+        list_text, keyboard = build_list_text_and_keyboard(chat_id)
+        send_message(chat_id, list_text, keyboard)
+        return
 
-    label = f"{title} — " if title else ""
-    edit_message(chat_id, message_id, f"Готово ✅\nЗаписал: {label}{amount:.2f} руб. до {due.strftime('%d.%m.%Y')}")
+    send_message(chat_id, "Не понял. Используй кнопки внизу или команды /add, /list", keyboard=main_menu_keyboard())
 
 
 # ================== МАРШРУТЫ FLASK ==================
@@ -384,6 +479,12 @@ def webhook():
             list_text, keyboard = build_list_text_and_keyboard(chat_id)
             edit_message(chat_id, message_id, list_text, keyboard)
 
+        elif data.startswith("edit:"):
+            answer_callback(cq["id"])
+            payment_id = int(data.split(":")[1])
+            set_state(chat_id, "edit_amount", {"edit_payment_id": payment_id})
+            send_message(chat_id, "Введи новую сумму:")
+
         elif data == "cal:ignore":
             answer_callback(cq["id"])
 
@@ -396,7 +497,11 @@ def webhook():
         elif data.startswith("cal:pick:"):
             answer_callback(cq["id"])
             picked_date = data.split(":")[2]
-            finish_add_with_date(chat_id, message_id, picked_date)
+            step, sdata = get_state(chat_id)
+            if step == "ask_date":
+                sdata["due_date"] = picked_date
+                set_state(chat_id, "ask_count", sdata)
+                ask_count(chat_id, message_id)
 
     return jsonify({"ok": True})
 
