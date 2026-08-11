@@ -185,11 +185,16 @@ def send_message(chat_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "text": text}
     if keyboard:
         payload["reply_markup"] = json.dumps(keyboard)
-    resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     try:
-        return resp.json().get("result", {}).get("message_id")
-    except Exception:
-        return None
+        resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+        j = resp.json()
+    except Exception as e:
+        return None, f"request_error: {e}"
+
+    if not j.get("ok"):
+        return None, j.get("description", "unknown_error")
+
+    return j.get("result", {}).get("message_id"), None
 
 
 def edit_message(chat_id, message_id, text, keyboard=None):
@@ -551,25 +556,32 @@ def check_reminders():
     today = date.today()
     tomorrow = today + timedelta(days=1)
     sent = 0
+    failed = []
 
     for payment_id, chat_id, title, amount, due_date in get_all_unpaid():
         due = datetime.strptime(due_date, "%Y-%m-%d").date()
         label = f"{title}: " if title else ""
 
         if due == today:
-            # в день платежа — напоминаем при каждом прогоне (несколько раз в день),
-            # пока платёж не будет отмечен оплаченным
             text = f"⚠️ Сегодня срок платежа!\n{label}{amount:.2f} руб."
         elif due == tomorrow and is_morning:
-            # за день до платежа — только один раз, на утреннем прогоне
             text = f"🔔 Завтра срок платежа.\n{label}{amount:.2f} руб."
         else:
             continue
 
-        send_message(chat_id, text)
-        sent += 1
+        message_id, error = send_message(chat_id, text)
+        if error:
+            failed.append({"chat_id": chat_id, "payment_id": payment_id, "error": error})
+        else:
+            sent += 1
 
-    return jsonify({"ok": True, "reminders_sent": sent, "morning": is_morning})
+    return jsonify({
+        "ok": True,
+        "server_date_utc": today.isoformat(),
+        "morning": is_morning,
+        "reminders_sent": sent,
+        "failed": failed,
+    })
 
 
 @app.route("/")
