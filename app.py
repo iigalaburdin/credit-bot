@@ -546,22 +546,30 @@ def check_reminders():
     if secret != REMINDER_SECRET:
         return "forbidden", 403
 
+    is_morning = request.args.get("morning") == "1"
+
     today = date.today()
     tomorrow = today + timedelta(days=1)
     sent = 0
+
     for payment_id, chat_id, title, amount, due_date in get_all_unpaid():
         due = datetime.strptime(due_date, "%Y-%m-%d").date()
         label = f"{title}: " if title else ""
+
         if due == today:
+            # в день платежа — напоминаем при каждом прогоне (несколько раз в день),
+            # пока платёж не будет отмечен оплаченным
             text = f"⚠️ Сегодня срок платежа!\n{label}{amount:.2f} руб."
-        elif due == tomorrow:
+        elif due == tomorrow and is_morning:
+            # за день до платежа — только один раз, на утреннем прогоне
             text = f"🔔 Завтра срок платежа.\n{label}{amount:.2f} руб."
         else:
             continue
+
         send_message(chat_id, text)
         sent += 1
 
-    return jsonify({"ok": True, "reminders_sent": sent})
+    return jsonify({"ok": True, "reminders_sent": sent, "morning": is_morning})
 
 
 @app.route("/")
