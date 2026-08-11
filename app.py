@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import calendar
 import requests
@@ -212,9 +213,13 @@ def start_add_flow(chat_id):
     set_state(chat_id, "ask_bank_amount")
     send_message(
         chat_id,
-        "Введи банк и сумму одной строкой, например:\nТинькофф 5000\n\n"
-        "Если название не важно — просто отправь сумму: 5000",
+        "Введи платёж одной строкой:\nБанк Сумма [Дата]\n\n"
+        "Например:\nТинькофф 5000\nТинькофф 5000 25.08.2026\n5000\n\n"
+        "Дату можно не указывать — тогда я предложу выбрать её в календаре.",
     )
+
+
+DATE_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}$")
 
 
 def parse_bank_amount(text):
@@ -232,6 +237,35 @@ def parse_bank_amount(text):
 
     title = " ".join(parts[:-1]).strip()
     return title, amount
+
+
+def parse_bank_amount_date(text):
+    """Разбирает строку вида 'Тинькофф 5000 25.08.2026'.
+    Возвращает (title, amount, due_date_or_None, error_or_None).
+    Если дата в конце строки не найдена — due_date будет None (значит, нужен календарь).
+    Если дата найдена, но некорректна — возвращается error."""
+    parts = text.strip().split()
+    if not parts:
+        return None, None, None, "empty"
+
+    due_date = None
+    if DATE_RE.match(parts[-1]):
+        date_token = parts.pop()
+        try:
+            due_date = datetime.strptime(date_token, "%d.%m.%Y").date().isoformat()
+        except ValueError:
+            return None, None, None, "bad_date"
+        if not parts:
+            return None, None, None, "bad_date"
+
+    last = parts[-1].replace(",", ".")
+    try:
+        amount = float(last)
+    except ValueError:
+        return None, None, None, "bad_amount"
+
+    title = " ".join(parts[:-1]).strip()
+    return title, amount, due_date, None
 
 
 def handle_text(chat_id, text):
@@ -267,18 +301,31 @@ def handle_text(chat_id, text):
     step, data = get_state(chat_id)
 
     if step == "ask_bank_amount":
-        title, amount = parse_bank_amount(text)
-        if amount is None:
+        title, amount, due_date, error = parse_bank_amount_date(text)
+
+        if error == "bad_date":
+            send_message(chat_id, "Дата некорректна. Формат: ДД.ММ.ГГГГ, например 25.08.2026. Попробуй ещё раз.")
+            return
+        if error == "bad_amount" or error == "empty":
             send_message(
                 chat_id,
-                "Не разобрал сумму. Напиши так: Тинькофф 5000 (или просто 5000, если без названия).",
+                "Не разобрал сумму. Напиши так: Тинькофф 5000 (можно добавить дату: Тинькофф 5000 25.08.2026).",
             )
             return
+
+        if due_date:
+            clear_state(chat_id)
+            add_payment(chat_id, title, amount, due_date)
+            label = f"{title} — " if title else ""
+            d = datetime.strptime(due_date, "%Y-%m-%d").date().strftime("%d.%m.%Y")
+            send_message(chat_id, f"Готово ✅\nЗаписал: {label}{amount:.2f} руб. до {d}", keyboard=main_menu_keyboard())
+            return
+
         data["title"] = title
         data["amount"] = amount
         set_state(chat_id, "ask_date", data)
         today = date.today()
-        send_message(chat_id, "Выбери дату платежа:", keyboard=build_calendar(today.year, today.month))
+        send_message(chat_id, "Дату не указал — выбери в календаре:", keyboard=build_calendar(today.year, today.month))
         return
 
     # На шаге даты пользователь должен нажимать календарь, а не писать текст
