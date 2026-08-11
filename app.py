@@ -47,8 +47,6 @@ def init_db():
         )
         """
     )
-    # миграция для баз, созданных до появления регулярных платежей —
-    # если колонки уже есть, Turso вернёт ошибку, её просто игнорируем
     for ddl in (
         "ALTER TABLE payments ADD COLUMN series_id INTEGER",
         "ALTER TABLE payments ADD COLUMN series_index INTEGER",
@@ -100,7 +98,6 @@ def add_payment(chat_id, title, amount, due_date, series_id=None, series_index=N
 
 
 def add_months(d: date, months: int) -> date:
-    """Прибавляет к дате указанное число месяцев, сохраняя число (с учётом коротких месяцев)."""
     total = d.month - 1 + months
     year = d.year + total // 12
     month = total % 12 + 1
@@ -109,7 +106,6 @@ def add_months(d: date, months: int) -> date:
 
 
 def add_series(chat_id, title, amount, start_date: date, count: int):
-    """Создаёт серию регулярных (ежемесячных) платежей."""
     first_id = add_payment(chat_id, title, amount, start_date.isoformat(), series_total=count, series_index=1)
     turso_db.execute("UPDATE payments SET series_id=? WHERE id=?", [first_id, first_id])
     for i in range(1, count):
@@ -118,12 +114,42 @@ def add_series(chat_id, title, amount, start_date: date, count: int):
     return first_id
 
 
+PAYMENT_FIELDS = "id, title, amount, due_date, series_id, series_index, series_total"
+
+
 def get_unpaid(chat_id):
     return turso_db.execute(
-        "SELECT id, title, amount, due_date, series_id, series_index, series_total "
-        "FROM payments WHERE chat_id=? AND paid=0 ORDER BY due_date ASC",
+        f"SELECT {PAYMENT_FIELDS} FROM payments WHERE chat_id=? AND paid=0 ORDER BY due_date ASC",
         [chat_id],
     )
+
+
+def get_nearest_unpaid_per_series(chat_id):
+    """Список неоплаченных платежей, но по каждой серии — только ближайший."""
+    rows = get_unpaid(chat_id)
+    seen = set()
+    result = []
+    for row in rows:
+        payment_id, title, amount, due_date, series_id, series_index, series_total = row
+        group_key = series_id if series_id else f"single-{payment_id}"
+        if group_key in seen:
+            continue
+        seen.add(group_key)
+        result.append(row)
+    return result
+
+
+def get_payment(payment_id):
+    rows = turso_db.execute(f"SELECT {PAYMENT_FIELDS} FROM payments WHERE id=?", [payment_id])
+    return rows[0] if rows else None
+
+
+def get_next_unpaid_in_series(series_id):
+    rows = turso_db.execute(
+        f"SELECT {PAYMENT_FIELDS} FROM payments WHERE series_id=? AND paid=0 ORDER BY due_date ASC LIMIT 1",
+        [series_id],
+    )
+    return rows[0] if rows else None
 
 
 def get_all_unpaid():
@@ -146,7 +172,6 @@ def get_series_id(payment_id):
 
 
 def update_amount(payment_id, new_amount):
-    """Меняет сумму. Если платёж — часть серии, обновляет её у всех ЕЩЁ НЕ оплаченных платежей серии."""
     series_id = get_series_id(payment_id)
     if series_id:
         turso_db.execute("UPDATE payments SET amount=? WHERE series_id=? AND paid=0", [new_amount, series_id])
@@ -160,14 +185,22 @@ def send_message(chat_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "text": text}
     if keyboard:
         payload["reply_markup"] = json.dumps(keyboard)
-    requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+    resp = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+    try:
+        return resp.json().get("result", {}).get("message_id")
+    except Exception:
+        return None
 
 
 def edit_message(chat_id, message_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    if keyboard:
+    if keyboard is not None:
         payload["reply_markup"] = json.dumps(keyboard)
     requests.post(f"{TELEGRAM_API}/editMessageText", json=payload, timeout=10)
+
+
+def delete_message(chat_id, message_id):
+    requests.post(f"{TELEGRAM_API}/deleteMessage", json={"chat_id": chat_id, "message_id": message_id}, timeout=10)
 
 
 def answer_callback(callback_id, text=None):
@@ -201,43 +234,40 @@ def fmt_date(iso_date: str) -> str:
     return datetime.strptime(iso_date, "%Y-%m-%d").date().strftime("%d.%m.%y")
 
 
-def build_list_text_and_keyboard(chat_id):
-    rows = get_unpaid(chat_id)
-    if not rows:
-        return "Список пуст — все платежи оплачены 🎉", None
+def format_payment_line(row) -> str:
+    payment_id, title, amount, due_date, series_id, series_index, series_total = row
+    d = fmt_date(due_date)
+    label = f"{title}\n" if title else ""
+    suffix = f"  🔁{series_index}/{series_total}" if series_total and series_total > 1 else ""
+    return f"{label}{amount:.2f} руб. — до {d}{suffix}"
 
-    seen_groups = set()
-    display_rows = []
-    for row in rows:
-        payment_id, title, amount, due_date, series_id, series_index, series_total = row
-        group_key = series_id if series_id else f"single-{payment_id}"
-        if group_key in seen_groups:
-            continue
-        seen_groups.add(group_key)
-        display_rows.append(row)
 
-    lines = ["Твои платежи:\n"]
-    buttons = []
-    for payment_id, title, amount, due_date, series_id, series_index, series_total in display_rows:
-        d = fmt_date(due_date)
-        label = f"{title}: " if title else ""
-        suffix = f" 🔁{series_index}/{series_total}" if series_total and series_total > 1 else ""
-        lines.append(f"• {label}{amount:.2f} руб. — до {d}{suffix}")
-        buttons.append([
+def payment_keyboard(payment_id):
+    return {
+        "inline_keyboard": [[
             {"text": "✅ Оплачено", "callback_data": f"paid:{payment_id}"},
             {"text": "✏️ Сумма", "callback_data": f"edit:{payment_id}"},
-            {"text": "🗑", "callback_data": f"del:{payment_id}"},
-        ])
+            {"text": "🗑 Удалить", "callback_data": f"del:{payment_id}"},
+        ]]
+    }
 
-    return "\n".join(lines), {"inline_keyboard": buttons}
+
+def send_list(chat_id):
+    rows = get_nearest_unpaid_per_series(chat_id)
+    if not rows:
+        send_message(chat_id, "Список пуст — все платежи оплачены 🎉")
+        return
+
+    send_message(chat_id, "📋 Твои платежи:")
+    for row in rows:
+        payment_id = row[0]
+        send_message(chat_id, format_payment_line(row), keyboard=payment_keyboard(payment_id))
 
 
 # ================== INLINE-КАЛЕНДАРЬ ==================
 
 def build_calendar(year, month):
-    """Строит inline-клавиатуру календаря на месяц."""
     buttons = []
-
     buttons.append([{"text": f"{MONTHS_RU[month]} {year % 100:02d}", "callback_data": "cal:ignore"}])
 
     week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -253,17 +283,13 @@ def build_calendar(year, month):
                 row.append({"text": str(day), "callback_data": f"cal:pick:{year}-{month:02d}-{day:02d}"})
         buttons.append(row)
 
-    prev_month = month - 1
-    prev_year = year
+    prev_month, prev_year = month - 1, year
     if prev_month == 0:
-        prev_month = 12
-        prev_year -= 1
+        prev_month, prev_year = 12, year - 1
 
-    next_month = month + 1
-    next_year = year
+    next_month, next_year = month + 1, year
     if next_month == 13:
-        next_month = 1
-        next_year += 1
+        next_month, next_year = 1, year + 1
 
     buttons.append([
         {"text": "« Пред.", "callback_data": f"cal:nav:{prev_year}-{prev_month:02d}"},
@@ -285,15 +311,10 @@ def start_add_flow(chat_id):
     )
 
 
-# дата в конце строки: ДД.ММ.ГГ или ДД.ММ.ГГГГ
 DATE_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.(\d{4}|\d{2})$")
 
 
 def parse_bank_amount_date(text):
-    """Разбирает строку вида 'Тинькофф 5000 25.08.26'.
-    Возвращает (title, amount, due_date_iso_or_None, error_or_None).
-    Если дата в конце строки не найдена — due_date будет None (значит, нужен календарь).
-    Если дата найдена, но некорректна — возвращается error."""
     parts = text.strip().split()
     if not parts:
         return None, None, None, "empty"
@@ -371,8 +392,7 @@ def handle_text(chat_id, text):
 
     if text in ("/list", "📋 Список платежей"):
         clear_state(chat_id)
-        list_text, keyboard = build_list_text_and_keyboard(chat_id)
-        send_message(chat_id, list_text, keyboard)
+        send_list(chat_id)
         return
 
     if text == "/cancel":
@@ -435,12 +455,16 @@ def handle_text(chat_id, text):
         except ValueError:
             send_message(chat_id, "Не похоже на число. Введи сумму ещё раз (например: 5000):")
             return
+
         payment_id = data.get("edit_payment_id")
+        edit_message_id = data.get("edit_message_id")
         clear_state(chat_id)
         update_amount(payment_id, new_amount)
+
+        row = get_payment(payment_id)
+        if row and edit_message_id:
+            edit_message(chat_id, edit_message_id, format_payment_line(row), keyboard=payment_keyboard(payment_id))
         send_message(chat_id, "Сумма обновлена ✅")
-        list_text, keyboard = build_list_text_and_keyboard(chat_id)
-        send_message(chat_id, list_text, keyboard)
         return
 
     send_message(chat_id, "Не понял. Используй кнопки внизу или команды /add, /list", keyboard=main_menu_keyboard())
@@ -466,23 +490,32 @@ def webhook():
         data = cq.get("data", "")
 
         if data.startswith("paid:"):
-            answer_callback(cq["id"])
             payment_id = int(data.split(":")[1])
-            mark_paid(payment_id)
-            list_text, keyboard = build_list_text_and_keyboard(chat_id)
-            edit_message(chat_id, message_id, list_text, keyboard)
+            row = get_payment(payment_id)
+            if not row or row[0] is None:
+                answer_callback(cq["id"], "Уже обработано")
+            else:
+                answer_callback(cq["id"], "Оплачено")
+                mark_paid(payment_id)
+                edit_message(chat_id, message_id, f"✅ {format_payment_line(row)}", keyboard={"inline_keyboard": []})
+
+                series_id = row[4]
+                if series_id:
+                    next_row = get_next_unpaid_in_series(series_id)
+                    if next_row:
+                        next_id = next_row[0]
+                        send_message(chat_id, format_payment_line(next_row), keyboard=payment_keyboard(next_id))
 
         elif data.startswith("del:"):
             answer_callback(cq["id"], "Удалено")
             payment_id = int(data.split(":")[1])
             delete_payment(payment_id)
-            list_text, keyboard = build_list_text_and_keyboard(chat_id)
-            edit_message(chat_id, message_id, list_text, keyboard)
+            delete_message(chat_id, message_id)
 
         elif data.startswith("edit:"):
             answer_callback(cq["id"])
             payment_id = int(data.split(":")[1])
-            set_state(chat_id, "edit_amount", {"edit_payment_id": payment_id})
+            set_state(chat_id, "edit_amount", {"edit_payment_id": payment_id, "edit_message_id": message_id})
             send_message(chat_id, "Введи новую сумму:")
 
         elif data == "cal:ignore":
